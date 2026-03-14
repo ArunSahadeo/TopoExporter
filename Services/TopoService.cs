@@ -138,16 +138,21 @@ namespace TopoExporter.Services
             var raw      = await File.ReadAllTextAsync(GeoJsonPath);
             var fc       = JObject.Parse(raw);
 
-            var features = (fc["features"] as JArray ?? new JArray())
+            // Group all source features by their BestCode so that countries
+            // Natural Earth splits across multiple rows (e.g. Ecuador mainland +
+            // Galápagos, Norway mainland + Svalbard) are merged into one geometry.
+            var featuresByCode = (fc["features"] as JArray ?? new JArray())
                 .Where(f =>
                 {
                     var p = f["properties"] as JObject;
                     return p != null && codeSet.Contains(BestCode(p));
                 })
+                .GroupBy(f => BestCode(f["properties"] as JObject ?? new JObject()),
+                         StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            progress?.Report($"Converting {features.Count} features to TopoJSON…");
-            var topoJson = await Task.Run(() => BuildTopoJson(features));
+            progress?.Report($"Converting {featuresByCode.Count} countries to TopoJSON…");
+            var topoJson = await Task.Run(() => BuildTopoJson(featuresByCode));
 
             progress?.Report("Writing file…");
             await File.WriteAllTextAsync(outputPath, topoJson, Encoding.UTF8);
@@ -224,9 +229,9 @@ namespace TopoExporter.Services
         // Arc deduplication is an optional TopoJSON optimisation; Power BI and
         // every other TopoJSON consumer work correctly without it.
         //
-        private static string BuildTopoJson(List<JToken> features)
+        private static string BuildTopoJson(List<IGrouping<string, JToken>> featureGroups)
         {
-            const int Q = 50_000; // quantisation grid size — high enough for small territories like HK and Singapore to render smoothly when zoomed
+            const int Q = 50_000; // quantisation grid size
 
             // Always use the full world extent so Power BI's Mercator projection
             // can correctly position countries on the globe.
@@ -242,93 +247,57 @@ namespace TopoExporter.Services
                 ((int)Math.Round((lon - minX) / scaleX),
                  (int)Math.Round((lat - minY) / scaleY));
 
-            // ── 1. Extract rings as lon/lat float lists ───────────────────────
-            // We work in floating-point degree space so that the inflation step
-            // (below) operates at full precision before we lose detail to the
-            // integer quantization grid.
+            // ── 1. Extract rings as lon/lat float lists, merging split features ─
+            // Natural Earth splits some countries across multiple rows with the same
+            // ADM0_A3 code (e.g. Ecuador mainland + Galápagos, Norway + Svalbard).
+            // We merge all rows sharing a code into one MultiPolygon so nothing
+            // is lost to the deduplication that previously dropped the mainland.
 
-            // Each entry: (gtype, list-of-polygons), each polygon = list-of-rings,
-            // each ring = List<(double lon, double lat)>
-            var featureRings = new List<(string gtype, List<List<List<(double lon, double lat)>>> polys)>();
+            // featureRings: one entry per exported country (group), holding all
+            // polygons from all source rows for that country.
+            // Each entry also carries the representative JToken for metadata.
+            var featureRings  = new List<(List<List<List<(double lon, double lat)>>> polys, JToken repFeature)>();
 
-            foreach (var f in features)
+            foreach (var group in featureGroups)
             {
-                var geom = f["geometry"];
-                if (geom == null || geom.Type == JTokenType.Null)
-                {
-                    featureRings.Add(("Polygon", new()));
-                    continue;
-                }
-
-                var gtype = geom["type"]?.ToString() ?? "";
-
-                IEnumerable<JToken> polygons = gtype == "MultiPolygon"
-                    ? (geom["coordinates"] ?? new JArray()).Select(p => p)
-                    : new[] { geom["coordinates"] ?? new JArray() };
-
                 var polys = new List<List<List<(double, double)>>>();
-                foreach (var poly in polygons)
+
+                foreach (var f in group)
                 {
-                    var rings = new List<List<(double, double)>>();
-                    foreach (var ring in poly)
+                    var geom = f["geometry"];
+                    if (geom == null || geom.Type == JTokenType.Null) continue;
+
+                    var gtype = geom["type"]?.ToString() ?? "";
+
+                    IEnumerable<JToken> polygons = gtype == "MultiPolygon"
+                        ? (geom["coordinates"] ?? new JArray()).Select(p => p)
+                        : new[] { geom["coordinates"] ?? new JArray() };
+
+                    foreach (var poly in polygons)
                     {
-                        var pts = ring
-                            .Select(pt => ((double)(pt[0] ?? 0), (double)(pt[1] ?? 0)))
-                            .ToList();
-                        if (pts.Count >= 3) rings.Add(pts);
+                        var rings = new List<List<(double, double)>>();
+                        foreach (var ring in poly)
+                        {
+                            var pts = ring
+                                .Select(pt => ((double)(pt[0] ?? 0), (double)(pt[1] ?? 0)))
+                                .ToList();
+                            if (pts.Count >= 3) rings.Add(pts);
+                        }
+                        if (rings.Count > 0) polys.Add(rings);
                     }
-                    if (rings.Count > 0) polys.Add(rings);
                 }
-                featureRings.Add((gtype == "MultiPolygon" ? "MultiPolygon" : "Polygon", polys));
+
+                // Use the first feature in the group for iso/name metadata
+                featureRings.Add((polys, group.First()));
             }
 
-            // ── 2. Inflate small features in lon/lat space ────────────────────
-            // A shape map canvas is roughly 800×500 px for a full-world view.
-            // Anything spanning less than ~6 px in either axis is invisible.
-            // We inflate the raw coordinates (before quantization) so the shape
-            // stays geometrically faithful — no jagged integer-scaling artefacts.
-            //
-            // Min visible span: 6 px → 6×(360/800) = 2.7° lon, 6×(180/500) = 2.16° lat
-            const double minLonSpan = 6.0 * 360.0 / 800.0;  // ~2.7°
-            const double minLatSpan = 6.0 * 180.0 / 500.0;  // ~2.16°
-
-            foreach (var (_, polys) in featureRings)
-            {
-                if (polys.Count == 0) continue;
-
-                var allPts = polys.SelectMany(p => p).SelectMany(r => r).ToList();
-                double mnLon = allPts.Min(p => p.lon);
-                double mxLon = allPts.Max(p => p.lon);
-                double mnLat = allPts.Min(p => p.lat);
-                double mxLat = allPts.Max(p => p.lat);
-
-                double lonSpan = mxLon - mnLon;
-                double latSpan = mxLat - mnLat;
-
-                if (lonSpan >= minLonSpan && latSpan >= minLatSpan) continue;
-
-                // Scale uniformly so the smaller axis meets its minimum
-                double factor = Math.Max(
-                    lonSpan > 0 ? minLonSpan / lonSpan : minLonSpan,
-                    latSpan > 0 ? minLatSpan / latSpan : minLatSpan);
-
-                double cx = (mnLon + mxLon) / 2.0;
-                double cy = (mnLat + mxLat) / 2.0;
-
-                foreach (var poly in polys)
-                    foreach (var ring in poly)
-                        for (int k = 0; k < ring.Count; k++)
-                            ring[k] = (cx + (ring[k].lon - cx) * factor,
-                                       cy + (ring[k].lat - cy) * factor);
-            }
-
-            // ── 3. Quantize and build arc list ────────────────────────────────
+            // ── 2. Quantize and build arc list ────────────────────────────────
             var arcs         = new List<List<(int x, int y)>>();
             var featureGeoms = new List<(string gtype, List<List<int>> polyArcLists)>();
 
             for (int fi = 0; fi < featureRings.Count; fi++)
             {
-                var (gtype, polys) = featureRings[fi];
+                var (polys, _) = featureRings[fi];
                 var polyArcLists = new List<List<int>>();
 
                 foreach (var poly in polys)
@@ -354,7 +323,7 @@ namespace TopoExporter.Services
                     if (arcIndicesForPoly.Count > 0)
                         polyArcLists.Add(arcIndicesForPoly);
                 }
-                featureGeoms.Add((gtype, polyArcLists));
+                featureGeoms.Add((polyArcLists.Count > 1 ? "MultiPolygon" : "Polygon", polyArcLists));
             }
 
             // ── 4. Encode arcs as delta sequences and serialise ───────────────
@@ -386,11 +355,11 @@ namespace TopoExporter.Services
             sb.Append("],\"objects\":{\"countries\":{\"type\":\"GeometryCollection\",\"geometries\":[");
 
             // ── 5. Write feature geometries ───────────────────────────────────
-            for (int fi = 0; fi < features.Count; fi++)
+            for (int fi = 0; fi < featureRings.Count; fi++)
             {
                 if (fi > 0) sb.Append(',');
                 var (gtype, polyArcLists) = featureGeoms[fi];
-                var props = features[fi]["properties"] as JObject ?? new JObject();
+                var props = featureRings[fi].repFeature["properties"] as JObject ?? new JObject();
                 var iso   = BestIsoCode(props);
                 var name  = BestName(props).Replace("\\", "\\\\").Replace("\"", "\\\"");
 
