@@ -24,7 +24,8 @@ namespace TopoExporter.Services
         private static readonly string[] CountryNamesToExclude = {
             "Cyprus U.N. Buffer Zone",
             "Siachen Glacier",
-            "Vatican"
+            "Vatican",
+            "Dhekelia"
         };
 
         private static readonly Dictionary<string, string> CountryNamesToStandardise = new Dictionary<string, string> {
@@ -36,7 +37,7 @@ namespace TopoExporter.Services
             {"Brunei Darussalam", "Brunei"},
             {"Kingdom of eSwatini", "Eswatini"},
             {"The Gambia", "Gambia"},
-            {"Dhekelia", "Akrotiri and Dhekelia"},
+            {"Akrotiri", "Akrotiri and Dhekelia"},
             {"Republic of Cabo Verde", "Cabo Verde"},
             {"Federated States of Micronesia", "Micronesia"},
             {"Falkland Islands / Malvinas", "Falkland Islands"}

@@ -47,7 +47,8 @@ namespace TopoExporter.ViewModels
         private static readonly string[] CountryNamesToExclude = {
             "Cyprus U.N. Buffer Zone",
             "Siachen Glacier",
-            "Vatican"
+            "Vatican",
+            "Dhekelia"
         };
 
         private static readonly Dictionary<string, string> CountryNamesToStandardise = new Dictionary<string, string> {
