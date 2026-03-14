@@ -443,6 +443,49 @@ namespace TopoExporter.Services
                 sb.Append("}}");
             }
 
+            // ── 6. Append synthetic Eurozone geometry ────────────────────────
+            // Collects all arc indices from Eurozone member countries that were
+            // included in this export and writes them as a single MultiPolygon
+            // named "Eurozone". Power BI can then match the "Eurozone" value in
+            // the Country field against this geometry entry.
+            var eurozoneMembers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Estonia",
+                "Finland", "France", "Germany", "Greece", "Ireland", "Italy",
+                "Latvia", "Lithuania", "Luxembourg", "Malta", "Netherlands",
+                "Portugal", "Slovakia", "Slovenia", "Spain"
+            };
+
+            var eurozoneArcLists = new List<List<int>>();
+            for (int fi = 0; fi < featureRings.Count; fi++)
+            {
+                var props = featureRings[fi].repFeature["properties"] as JObject ?? new JObject();
+                var name  = BestName(props);
+                if (CountryNamesToStandardise.TryGetValue(name, out var sn)) name = sn;
+                if (!eurozoneMembers.Contains(name)) continue;
+
+                var (_, polyArcLists) = featureGeoms[fi];
+                eurozoneArcLists.AddRange(polyArcLists);
+            }
+
+            if (eurozoneArcLists.Count > 0)
+            {
+                sb.Append(",{\"type\":\"MultiPolygon\",\"arcs\":[");
+                for (int pi = 0; pi < eurozoneArcLists.Count; pi++)
+                {
+                    if (pi > 0) sb.Append(',');
+                    sb.Append("[[");
+                    var arcIndices = eurozoneArcLists[pi];
+                    for (int ai = 0; ai < arcIndices.Count; ai++)
+                    {
+                        if (ai > 0) sb.Append(',');
+                        sb.Append(arcIndices[ai]);
+                    }
+                    sb.Append("]]");
+                }
+                sb.Append("],\"properties\":{\"iso\":\"EUZ\",\"name\":\"Eurozone\"}}");
+            }
+
             sb.Append("]}}}");
             return sb.ToString();
         }
