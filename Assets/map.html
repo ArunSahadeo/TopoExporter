@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>TopoExporter Map</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 100vw; height: 100vh; overflow: hidden;
+    background: #111a26;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  body.dark { background: #080d14; }
+
+  #map-container { width: 100%; height: 100%; position: relative; }
+  svg { width: 100%; height: 100%; display: block; }
+
+  /* ── Globe layers ────────────────────────────────────────────────── */
+  .space-bg   { fill: #0a1628; }
+  .ocean      { fill: #1a6494; }
+  .graticule  { fill: none; stroke: rgba(255,255,255,0.07); stroke-width: 0.5px; }
+
+  .country {
+    stroke: rgba(255,255,255,0.2);
+    stroke-width: 0.4px;
+    vector-effect: non-scaling-stroke;
+    cursor: pointer;
+  }
+  .country.land         { fill: #3d7a9e; }
+  .country.land:hover   { fill: #5fa0c4; }
+  .country.selected     { fill: #f0a030; stroke: rgba(255,255,255,0.6); stroke-width: 1px; }
+  .country.selected:hover { fill: #ffc040; }
+  .country.no-code      { fill: #2a5c7a; pointer-events: none; cursor: default; }
+
+  body.dark .country.land       { fill: #254d66; }
+  body.dark .country.land:hover { fill: #3a6888; }
+
+  .globe-outline { fill: none; stroke: rgba(80,160,240,0.2); stroke-width: 2px; }
+
+  /* ── UI overlays ─────────────────────────────────────────────────── */
+  #tooltip {
+    position: absolute; pointer-events: none; display: none;
+    background: rgba(5,15,30,0.93); color: #fff;
+    padding: 7px 12px; border-radius: 6px; font-size: 13px;
+    border: 1px solid rgba(100,180,255,0.3); white-space: nowrap;
+  }
+  .tt-name { font-weight: 600; font-size: 14px; }
+  .tt-hint { font-size: 11px; color: #80c0e8; margin-top: 3px; }
+
+  #status-bar {
+    position: absolute; bottom: 10px; left: 10px;
+    background: rgba(5,15,30,0.8); color: #8cc;
+    font-size: 11px; padding: 4px 10px; border-radius: 4px;
+    pointer-events: none;
+  }
+  #controls-hint {
+    position: absolute; bottom: 10px; right: 10px;
+    background: rgba(5,15,30,0.65); color: #556;
+    font-size: 10px; padding: 4px 8px; border-radius: 4px;
+    pointer-events: none; line-height: 1.8; text-align: right;
+  }
+
+  #loading-overlay {
+    position: absolute; inset: 0;
+    background: rgba(8,18,32,0.95);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    color: #9bbcdd; font-size: 14px; gap: 16px;
+    z-index: 100;
+  }
+  .spinner {
+    width: 40px; height: 40px;
+    border: 3px solid rgba(0,140,255,0.18);
+    border-top-color: #0090ff;
+    border-radius: 50%;
+    animation: spin 0.85s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="map-container">
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <div id="loading-text">Initialising…</div>
+  </div>
+  <div id="tooltip">
+    <div class="tt-name" id="tt-name"></div>
+    <div class="tt-hint" id="tt-hint"></div>
+  </div>
+  <div id="status-bar">0 countries selected</div>
+  <div id="controls-hint">Drag to rotate<br>Scroll / Ctrl++ Ctrl−  to zoom</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────────────────
+let geoData       = null;   // parsed GeoJSON FeatureCollection
+let selectedCodes = new Set();
+let countryMeta   = {};     // ADM0_A3 → { name }
+let isDragging    = false;
+
+let rotate       = [-20, -25, 0];
+let baseScale    = 300;
+let currentScale = baseScale;
+
+const container = document.getElementById('map-container');
+const tooltip   = document.getElementById('tooltip');
+const statusBar = document.getElementById('status-bar');
+const loading   = document.getElementById('loading-overlay');
+const loadingTxt= document.getElementById('loading-text');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SVG / D3 setup
+// ─────────────────────────────────────────────────────────────────────────────
+const svg = d3.select('#map-container').append('svg');
+
+// Clip path — keeps country fill inside the globe circle
+const defs = svg.append('defs');
+const clipCircle = defs.append('clipPath').attr('id', 'globe-clip')
+  .append('circle');
+
+// Draw-order layers
+const lSpace   = svg.append('g');   // space background
+const lOcean   = svg.append('g');   // ocean sphere
+const lGrat    = svg.append('g');   // graticule
+const lLand    = svg.append('g').attr('clip-path', 'url(#globe-clip)'); // countries
+const lRing    = svg.append('g');   // horizon ring (on top)
+
+const projection = d3.geoOrthographic()
+  .clipAngle(90)
+  .precision(0.5);
+
+const path      = d3.geoPath().projection(projection);
+const graticule = d3.geoGraticule()();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Resize
+// ─────────────────────────────────────────────────────────────────────────────
+function resize() {
+  const W = container.clientWidth  || window.innerWidth;
+  const H = container.clientHeight || window.innerHeight;
+
+  svg.attr('width', W).attr('height', H);
+
+  const r = Math.min(W, H) * 0.44;
+  const zr = baseScale > 0 ? currentScale / baseScale : 1;
+  baseScale    = r;
+  currentScale = r * zr;
+
+  projection
+    .scale(currentScale)
+    .translate([W / 2, H / 2])
+    .rotate(rotate);
+
+  updateClip();
+  draw();
+}
+
+function updateClip() {
+  const [cx, cy] = projection.translate();
+  const r        = projection.scale();
+  clipCircle.attr('cx', cx).attr('cy', cy).attr('r', r);
+}
+
+new ResizeObserver(resize).observe(container);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Draw
+// ─────────────────────────────────────────────────────────────────────────────
+function draw() {
+  const [cx, cy] = projection.translate();
+  const r        = projection.scale();
+
+  // Space disc
+  lSpace.selectAll('circle').data([0]).join('circle')
+    .attr('class', 'space-bg')
+    .attr('cx', cx).attr('cy', cy).attr('r', r);
+
+  // Ocean
+  lOcean.selectAll('path').data([{ type: 'Sphere' }]).join('path')
+    .attr('class', 'ocean').attr('d', path);
+
+  // Graticule
+  lGrat.selectAll('path').data([graticule]).join('path')
+    .attr('class', 'graticule').attr('d', path);
+
+  // Countries — only if data is loaded
+  if (geoData) {
+    lLand.selectAll('path')
+      .data(geoData.features, d => d._idx)
+      .join('path')
+      .attr('class', featureClass)
+      .attr('d', path)
+      .attr('data-code', d => getCode(d) ?? '')
+      .on('mousemove', onHover)
+      .on('mouseleave', () => { tooltip.style.display = 'none'; })
+      .on('click', onClick);
+  }
+
+  // Horizon ring (drawn last, on top)
+  lRing.selectAll('path').data([{ type: 'Sphere' }]).join('path')
+    .attr('class', 'globe-outline').attr('d', path);
+
+  updateClip();
+}
+
+// Recompute only the 'd' attributes during rotation (faster than full draw)
+function drawPaths() {
+  lOcean.selectAll('path').attr('d', path);
+  lGrat.selectAll('path').attr('d', path);
+  lLand.selectAll('path').attr('d', path);
+  lRing.selectAll('path').attr('d', path);
+  updateClip();
+  // Reposition background disc centre
+  const [cx, cy] = projection.translate();
+  lSpace.selectAll('circle').attr('cx', cx).attr('cy', cy);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function getCode(d) {
+  const p = d.properties || {};
+  for (const k of ['ADM0_A3', 'ISO_A3', 'GU_A3', 'ISO_A3_EH']) {
+    const v = (p[k] || '').replace(/\x00/g, '').trim();
+    if (v && v !== '-99' && v !== '-1') return v;
+  }
+  return null;
+}
+
+function getName(d) {
+  const code = getCode(d);
+  if (code && countryMeta[code]) return countryMeta[code].name;
+  const p = d.properties || {};
+  return p.NAME_LONG || p.NAME || p.ADMIN || code || '?';
+}
+
+function featureClass(d) {
+  const code = getCode(d);
+  if (!code) return 'country no-code';
+  return 'country land' + (selectedCodes.has(code) ? ' selected' : '');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Drag to rotate
+// ─────────────────────────────────────────────────────────────────────────────
+let dragOrigin  = null;
+let rotateSnap  = null;
+let hasDragged  = false;
+
+svg.style('cursor', 'grab')
+   .call(d3.drag()
+    .on('start', ev => {
+      dragOrigin = [ev.x, ev.y];
+      rotateSnap = projection.rotate().slice();
+      hasDragged = false;
+      svg.style('cursor', 'grabbing');
+      tooltip.style.display = 'none';
+    })
+    .on('drag', ev => {
+      if (!dragOrigin) return;
+      const dx = ev.x - dragOrigin[0];
+      const dy = ev.y - dragOrigin[1];
+      if (Math.abs(dx) + Math.abs(dy) > 3) { hasDragged = true; isDragging = true; }
+      // Sensitivity scales inversely with zoom: at 2x zoom, 1 px rotates half as far.
+      // baseScale / currentScale = 1.0 at default zoom, 0.33 at 3x zoom, etc.
+      const sensitivity = 0.22 * (baseScale / currentScale);
+      rotate = [
+        rotateSnap[0] + dx * sensitivity,
+        Math.max(-90, Math.min(90, rotateSnap[1] - dy * sensitivity)),
+        0
+      ];
+      projection.rotate(rotate);
+      drawPaths();   // cheap path-only update during drag
+    })
+    .on('end', () => {
+      dragOrigin = null;
+      svg.style('cursor', 'grab');
+      setTimeout(() => { isDragging = false; }, 60);
+    })
+  );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zoom
+// ─────────────────────────────────────────────────────────────────────────────
+const ZOOM_MIN = 0.45;
+const ZOOM_MAX = 14;
+
+function applyZoom(factor) {
+  currentScale = Math.max(baseScale * ZOOM_MIN,
+                  Math.min(baseScale * ZOOM_MAX, currentScale * factor));
+  projection.scale(currentScale);
+  draw();
+}
+
+svg.on('wheel', ev => {
+  ev.preventDefault();
+  applyZoom(ev.deltaY > 0 ? 0.88 : 1.14);
+}, { passive: false });
+
+window.addEventListener('keydown', ev => {
+  if (!ev.ctrlKey) return;
+  if (ev.key === '+' || ev.key === '=' || ev.code === 'Equal') {
+    ev.preventDefault(); applyZoom(1.2);
+  } else if (ev.key === '-' || ev.code === 'Minus') {
+    ev.preventDefault(); applyZoom(1 / 1.2);
+  } else if (ev.key === '0') {
+    ev.preventDefault();
+    currentScale = baseScale; projection.scale(currentScale); draw();
+  }
+});
+
+window.zoomIn    = () => applyZoom(1.2);
+window.zoomOut   = () => applyZoom(1 / 1.2);
+window.zoomReset = () => { currentScale = baseScale; projection.scale(currentScale); draw(); };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mouse events
+// ─────────────────────────────────────────────────────────────────────────────
+function onHover(ev, d) {
+  if (isDragging) { tooltip.style.display = 'none'; return; }
+  const code = getCode(d);
+  if (!code) { tooltip.style.display = 'none'; return; }
+
+  document.getElementById('tt-name').textContent = getName(d);
+  document.getElementById('tt-hint').textContent =
+    selectedCodes.has(code) ? '✓ Selected — click to deselect' : 'Click to select';
+  tooltip.style.display = 'block';
+
+  const rect = container.getBoundingClientRect();
+  let x = ev.clientX - rect.left + 14;
+  let y = ev.clientY - rect.top  - 10;
+  if (x + 230 > rect.width)  x -= 244;
+  if (y + 60  > rect.height) y -= 58;
+  tooltip.style.left = x + 'px';
+  tooltip.style.top  = y + 'px';
+}
+
+function onClick(ev, d) {
+  if (hasDragged || isDragging) return;
+  const code = getCode(d);
+  if (!code) return;
+
+  if (selectedCodes.has(code)) selectedCodes.delete(code);
+  else selectedCodes.add(code);
+
+  // Update just this one path's class — no full redraw needed
+  d3.select(ev.currentTarget).attr('class', featureClass(d));
+  updateStatus();
+
+  if (window.chrome?.webview) {
+    window.chrome.webview.postMessage(JSON.stringify({
+      type: 'countryToggled', code, selected: selectedCodes.has(code)
+    }));
+  }
+}
+
+function updateStatus() {
+  const n = selectedCodes.size;
+  statusBar.textContent =
+    n === 0 ? 'No countries selected'
+    : n === 1 ? '1 country selected'
+    : n + ' countries selected';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WPF-callable API
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Fetch GeoJSON from the virtual host URL (preferred — no string-injection limits). */
+window.loadGeoJSONFromUrl = function(url) {
+  loadingTxt.textContent = 'Fetching map data…';
+  loading.style.display  = 'flex';
+
+  fetch(url)
+    .then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      loadingTxt.textContent = 'Parsing features…';
+      return r.json();
+    })
+    .then(data => {
+      geoData = data;
+      // Stamp each feature with a stable numeric index for keyed joins
+      geoData.features.forEach((f, i) => { f._idx = i; });
+      resize();
+      loading.style.display = 'none';
+    })
+    .catch(err => {
+      loading.innerHTML =
+        '<div style="color:#f66;font-weight:600">Failed to load map</div>' +
+        '<div style="font-size:11px;color:#aaa;margin-top:8px">' + err.message + '</div>';
+    });
+};
+
+/**
+ * Sync the selected-country set from WPF.
+ * Receives a JSON-encoded string (double-encoded) so we JSON.parse() it.
+ * Fast path: just swap the Set and update CSS classes on existing paths.
+ */
+window.updateCountries = function(jsonStr) {
+  try {
+    const list = JSON.parse(jsonStr);
+
+    // Rebuild metadata map
+    countryMeta = {};
+    for (const c of list) {
+      if (c.code) countryMeta[c.code] = { name: c.name };
+    }
+
+    // Rebuild selection set
+    selectedCodes = new Set(
+      list.filter(c => c.isSelected && c.code).map(c => c.code)
+    );
+
+    // Update only the CSS class on each path — no geometry recalculation
+    lLand.selectAll('path').attr('class', function(d) {
+      return d ? featureClass(d) : 'country land';
+    });
+
+    updateStatus();
+  } catch (e) { console.error('updateCountries:', e); }
+};
+
+window.exportGeoJSON = function(jsonStr) {
+  try {
+    const list = JSON.parse(jsonStr);
+    const sel  = new Set(list.filter(c => c.isSelected && c.code).map(c => c.code));
+    if (!geoData) return JSON.stringify({ error: 'No data loaded' });
+    const features = geoData.features.filter(f => {
+      const c = getCode(f);
+      return c !== null && sel.has(c);
+    });
+    return JSON.stringify({ type: 'FeatureCollection', features });
+  } catch (e) { return JSON.stringify({ error: e.message }); }
+};
+
+window.setDarkMode = function(on) {
+  document.body.classList.toggle('dark', !!on);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+window.addEventListener('load', resize);
+</script>
+</body>
+</html>
