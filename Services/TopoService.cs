@@ -136,12 +136,6 @@ namespace TopoExporter.Services
             var raw      = await File.ReadAllTextAsync(GeoJsonPath);
             var fc       = JObject.Parse(raw);
 
-            using (StreamWriter sw = File.AppendText(Path.Combine(TopoService.AppDataDir, "debug.log"))) {
-                foreach (JProperty property in fc.Properties()) {
-                    sw.WriteLine($"The GeoJSON key name: {property.Name}");
-                }
-            }
-
             var features = (fc["features"] as JArray ?? new JArray())
                 .Where(f =>
                 {
@@ -220,47 +214,35 @@ namespace TopoExporter.Services
 
         // ── GeoJSON → TopoJSON conversion ─────────────────────────────────────
         //
-        // Implements a lightweight but correct topology builder:
-        //   1. Quantize all coordinates to integers (reduces file size ~40 %)
-        //   2. Extract every ring from Polygon / MultiPolygon geometries
-        //   3. Detect shared arcs via a hashtable keyed on sorted endpoint pairs
-        //   4. Emit delta-encoded arc arrays (further reduces file size)
-        //   5. Write the TopoJSON spec-compliant object with only iso + name props
+        // Each ring is stored as its own arc (no arc deduplication). This avoids
+        // the hash-collision bug where rings from different countries that happen
+        // to share a canonical endpoint key get merged into a single arc, causing
+        // one country's geometry to bleed into another country's entry.
+        //
+        // Arc deduplication is an optional TopoJSON optimisation; Power BI and
+        // every other TopoJSON consumer work correctly without it.
         //
         private static string BuildTopoJson(List<JToken> features)
         {
-            // ── 1. Collect all rings and compute bounding box ─────────────────
             const int Q = 10_000; // quantisation grid size
 
-            // First pass: find global bbox
-            double minX =  180, maxX = -180, minY =  90, maxY = -90;
-            foreach (var f in features)
-                WalkCoords(f["geometry"], (x, y) =>
-                {
-                    if (x < minX) minX = x; if (x > maxX) maxX = x;
-                    if (y < minY) minY = y; if (y > maxY) maxY = y;
-                });
+            // Always use the full world extent so Power BI's Mercator projection
+            // can correctly position countries on the globe.
+            const double minX = -180.0;
+            const double maxX =  180.0;
+            const double minY =  -90.0;
+            const double maxY =   90.0;
 
-            // Small padding so edge points aren't clipped
-            minX -= 0.001; minY -= 0.001; maxX += 0.001; maxY += 0.001;
-
-            double scaleX  = (maxX - minX) / (Q - 1);
-            double scaleY  = (maxY - minY) / (Q - 1);
-            if (scaleX == 0) scaleX = 1;
-            if (scaleY == 0) scaleY = 1;
+            double scaleX = (maxX - minX) / (Q - 1);
+            double scaleY = (maxY - minY) / (Q - 1);
 
             (int qx, int qy) Quantize(double lon, double lat) =>
                 ((int)Math.Round((lon - minX) / scaleX),
                  (int)Math.Round((lat - minY) / scaleY));
 
-            // ── 2. Build arc list and feature→arc-index map ───────────────────
-            // Key = "x1,y1|x2,y2" (first and last quantized point, canonical order)
-            var arcIndex  = new Dictionary<string, int>();
-            var arcs      = new List<List<(int x, int y)>>();
-
-            // Per-feature: list of geometry objects (each is a list of rings;
-            // each ring is a list of arc indices, negative = reversed)
-            var featureGeoms = new List<(string type, List<List<int[]>> rings)>();
+            // ── 1. Build one arc per ring — no deduplication ──────────────────
+            var arcs         = new List<List<(int x, int y)>>();
+            var featureGeoms = new List<(string type, List<List<int>> rings)>();
 
             foreach (var f in features)
             {
@@ -272,81 +254,50 @@ namespace TopoExporter.Services
                 }
 
                 var gtype = geom["type"]?.ToString() ?? "";
-                var rings = new List<List<int[]>>();
 
+                // Normalise to a list-of-polygons, each polygon = list-of-rings
                 IEnumerable<JToken> polygons = gtype == "MultiPolygon"
                     ? (geom["coordinates"] ?? new JArray()).Select(p => p)
                     : new[] { geom["coordinates"] ?? new JArray() };
 
+                // polyArcLists = one entry per polygon, each entry = arc indices for that polygon
+                var polyArcLists = new List<List<int>>();
+
                 foreach (var poly in polygons)
                 {
-                    var polyRings = new List<int[]>();
+                    var arcIndicesForPoly = new List<int>();
+
                     foreach (var ring in poly)
                     {
+                        // Quantize every coordinate
                         var qpts = ring
-                            .Select(pt =>
-                            {
-                                var (qx, qy) = Quantize(
-                                    (double)(pt[0] ?? 0), (double)(pt[1] ?? 0));
-                                return (qx, qy);
-                            })
+                            .Select(pt => Quantize((double)(pt[0] ?? 0), (double)(pt[1] ?? 0)))
                             .ToList();
 
-                        // Deduplicate consecutive identical points
+                        // Remove consecutive duplicate quantized points
                         var deduped = new List<(int x, int y)> { qpts[0] };
                         for (int i = 1; i < qpts.Count; i++)
                             if (qpts[i] != deduped[^1]) deduped.Add(qpts[i]);
 
-                        // Need at least 3 distinct points + closing = 4
+                        // Need at least 3 distinct points to form a valid ring
                         if (deduped.Count < 3) continue;
 
                         // Ensure ring is closed
                         if (deduped[0] != deduped[^1]) deduped.Add(deduped[0]);
 
-                        var first = deduped[0];
-                        var last  = deduped[^1];  // same as first after closing
-
-                        // Canonical key: sort the two endpoints to detect reversal
-                        string Pt(int x, int y) => $"{x},{y}";
-                        string key;
-                        bool reversed;
-                        var f0 = Pt(first.x, first.y);
-                        var l0 = Pt(deduped[1].x, deduped[1].y); // second point as tie-break
-                        var fn = Pt(deduped[^2].x, deduped[^2].y);
-                        if (string.Compare(f0 + "|" + l0,
-                                           Pt(deduped[^1].x, deduped[^1].y) + "|" + fn,
-                                           StringComparison.Ordinal) <= 0)
-                        {
-                            key = f0 + "|" + l0;
-                            reversed = false;
-                        }
-                        else
-                        {
-                            key = Pt(deduped[^1].x, deduped[^1].y) + "|" + fn;
-                            reversed = true;
-                        }
-
-                        if (!arcIndex.TryGetValue(key, out int idx))
-                        {
-                            idx = arcs.Count;
-                            arcIndex[key] = idx;
-                            arcs.Add(reversed
-                                ? Enumerable.Reverse(deduped).ToList()
-                                : deduped);
-                        }
-
-                        polyRings.Add(new[] { reversed ? ~idx : idx });
+                        // Each ring becomes its own arc — no deduplication
+                        arcIndicesForPoly.Add(arcs.Count);
+                        arcs.Add(deduped);
                     }
 
-                    if (polyRings.Count > 0)
-                        rings.Add(polyRings.SelectMany(r => r)
-                            .Select(i => new[] { i }).ToList());
+                    if (arcIndicesForPoly.Count > 0)
+                        polyArcLists.Add(arcIndicesForPoly);
                 }
 
-                featureGeoms.Add((gtype == "MultiPolygon" ? "MultiPolygon" : "Polygon", rings));
+                featureGeoms.Add((gtype == "MultiPolygon" ? "MultiPolygon" : "Polygon", polyArcLists));
             }
 
-            // ── 3. Encode arcs as delta sequences ─────────────────────────────
+            // ── 2. Encode arcs as delta sequences and serialise ───────────────
             var sb = new StringBuilder();
             sb.Append("{\"type\":\"Topology\",");
             sb.Append("\"transform\":{");
@@ -374,38 +325,36 @@ namespace TopoExporter.Services
 
             sb.Append("],\"objects\":{\"countries\":{\"type\":\"GeometryCollection\",\"geometries\":[");
 
-            // ── 4. Write feature geometries ───────────────────────────────────
+            // ── 3. Write feature geometries ───────────────────────────────────
             for (int fi = 0; fi < features.Count; fi++)
             {
                 if (fi > 0) sb.Append(',');
-                var (gtype, rings) = featureGeoms[fi];
+                var (gtype, polyArcLists) = featureGeoms[fi];
                 var props = features[fi]["properties"] as JObject ?? new JObject();
                 var iso   = BestIsoCode(props);
                 var name  = BestName(props).Replace("\\", "\\\\").Replace("\"", "\\\"");
 
-                if (CountryNamesToStandardise.ContainsKey(name)) {
-                    name = CountryNamesToStandardise[name];
-                }
+                if (CountryNamesToStandardise.TryGetValue(name, out var standardName))
+                    name = standardName;
 
                 sb.Append("{\"type\":\"");
 
-                if (rings.Count == 0)
+                if (polyArcLists.Count == 0)
                 {
-                    // No geometry — emit a null geometry
                     sb.Append("GeometryCollection\",\"geometries\":[]");
                 }
                 else if (gtype == "MultiPolygon")
                 {
                     sb.Append("MultiPolygon\",\"arcs\":[");
-                    for (int ri = 0; ri < rings.Count; ri++)
+                    for (int pi = 0; pi < polyArcLists.Count; pi++)
                     {
-                        if (ri > 0) sb.Append(',');
+                        if (pi > 0) sb.Append(',');
                         sb.Append("[[");
-                        var ring = rings[ri];
-                        for (int ai = 0; ai < ring.Count; ai++)
+                        var arcIndices = polyArcLists[pi];
+                        for (int ai = 0; ai < arcIndices.Count; ai++)
                         {
                             if (ai > 0) sb.Append(',');
-                            sb.Append(ring[ai][0]);
+                            sb.Append(arcIndices[ai]);
                         }
                         sb.Append("]]");
                     }
@@ -413,15 +362,13 @@ namespace TopoExporter.Services
                 }
                 else
                 {
+                    // Polygon: outer ring + optional hole rings, all in one array
                     sb.Append("Polygon\",\"arcs\":[[");
-                    if (rings.Count > 0)
+                    var arcIndices = polyArcLists[0];
+                    for (int ai = 0; ai < arcIndices.Count; ai++)
                     {
-                        var ring = rings[0];
-                        for (int ai = 0; ai < ring.Count; ai++)
-                        {
-                            if (ai > 0) sb.Append(',');
-                            sb.Append(ring[ai][0]);
-                        }
+                        if (ai > 0) sb.Append(',');
+                        sb.Append(arcIndices[ai]);
                     }
                     sb.Append("]]");
                 }
@@ -436,34 +383,6 @@ namespace TopoExporter.Services
             return sb.ToString();
         }
 
-        // Walk every [lon,lat] coordinate pair in a GeoJSON geometry
-        private static void WalkCoords(JToken? geom, Action<double, double> visit)
-        {
-            if (geom == null || geom.Type == JTokenType.Null) return;
-            var type  = geom["type"]?.ToString() ?? "";
-            var coords = geom["coordinates"];
-            if (coords == null) return;
-
-            if (type == "Point")
-            {
-                visit((double)coords[0]!, (double)coords[1]!);
-            }
-            else if (type == "LineString" || type == "MultiPoint")
-            {
-                foreach (var pt in coords) visit((double)pt[0]!, (double)pt[1]!);
-            }
-            else if (type == "Polygon" || type == "MultiLineString")
-            {
-                foreach (var ring in coords)
-                    foreach (var pt in ring) visit((double)pt[0]!, (double)pt[1]!);
-            }
-            else if (type == "MultiPolygon")
-            {
-                foreach (var poly in coords)
-                    foreach (var ring in poly)
-                        foreach (var pt in ring) visit((double)pt[0]!, (double)pt[1]!);
-            }
-        }
     }
 
     public record CountryEntry
