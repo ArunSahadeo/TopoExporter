@@ -226,7 +226,7 @@ namespace TopoExporter.Services
         //
         private static string BuildTopoJson(List<JToken> features)
         {
-            const int Q = 10_000; // quantisation grid size
+            const int Q = 50_000; // quantisation grid size — high enough for small territories like HK and Singapore to render smoothly when zoomed
 
             // Always use the full world extent so Power BI's Mercator projection
             // can correctly position countries on the globe.
@@ -242,64 +242,122 @@ namespace TopoExporter.Services
                 ((int)Math.Round((lon - minX) / scaleX),
                  (int)Math.Round((lat - minY) / scaleY));
 
-            // ── 1. Build one arc per ring — no deduplication ──────────────────
-            var arcs         = new List<List<(int x, int y)>>();
-            var featureGeoms = new List<(string type, List<List<int>> rings)>();
+            // ── 1. Extract rings as lon/lat float lists ───────────────────────
+            // We work in floating-point degree space so that the inflation step
+            // (below) operates at full precision before we lose detail to the
+            // integer quantization grid.
+
+            // Each entry: (gtype, list-of-polygons), each polygon = list-of-rings,
+            // each ring = List<(double lon, double lat)>
+            var featureRings = new List<(string gtype, List<List<List<(double lon, double lat)>>> polys)>();
 
             foreach (var f in features)
             {
                 var geom = f["geometry"];
                 if (geom == null || geom.Type == JTokenType.Null)
                 {
-                    featureGeoms.Add(("Polygon", new()));
+                    featureRings.Add(("Polygon", new()));
                     continue;
                 }
 
                 var gtype = geom["type"]?.ToString() ?? "";
 
-                // Normalise to a list-of-polygons, each polygon = list-of-rings
                 IEnumerable<JToken> polygons = gtype == "MultiPolygon"
                     ? (geom["coordinates"] ?? new JArray()).Select(p => p)
                     : new[] { geom["coordinates"] ?? new JArray() };
 
-                // polyArcLists = one entry per polygon, each entry = arc indices for that polygon
-                var polyArcLists = new List<List<int>>();
-
+                var polys = new List<List<List<(double, double)>>>();
                 foreach (var poly in polygons)
                 {
-                    var arcIndicesForPoly = new List<int>();
-
+                    var rings = new List<List<(double, double)>>();
                     foreach (var ring in poly)
                     {
-                        // Quantize every coordinate
-                        var qpts = ring
-                            .Select(pt => Quantize((double)(pt[0] ?? 0), (double)(pt[1] ?? 0)))
+                        var pts = ring
+                            .Select(pt => ((double)(pt[0] ?? 0), (double)(pt[1] ?? 0)))
                             .ToList();
+                        if (pts.Count >= 3) rings.Add(pts);
+                    }
+                    if (rings.Count > 0) polys.Add(rings);
+                }
+                featureRings.Add((gtype == "MultiPolygon" ? "MultiPolygon" : "Polygon", polys));
+            }
 
-                        // Remove consecutive duplicate quantized points
+            // ── 2. Inflate small features in lon/lat space ────────────────────
+            // A shape map canvas is roughly 800×500 px for a full-world view.
+            // Anything spanning less than ~6 px in either axis is invisible.
+            // We inflate the raw coordinates (before quantization) so the shape
+            // stays geometrically faithful — no jagged integer-scaling artefacts.
+            //
+            // Min visible span: 6 px → 6×(360/800) = 2.7° lon, 6×(180/500) = 2.16° lat
+            const double minLonSpan = 6.0 * 360.0 / 800.0;  // ~2.7°
+            const double minLatSpan = 6.0 * 180.0 / 500.0;  // ~2.16°
+
+            foreach (var (_, polys) in featureRings)
+            {
+                if (polys.Count == 0) continue;
+
+                var allPts = polys.SelectMany(p => p).SelectMany(r => r).ToList();
+                double mnLon = allPts.Min(p => p.lon);
+                double mxLon = allPts.Max(p => p.lon);
+                double mnLat = allPts.Min(p => p.lat);
+                double mxLat = allPts.Max(p => p.lat);
+
+                double lonSpan = mxLon - mnLon;
+                double latSpan = mxLat - mnLat;
+
+                if (lonSpan >= minLonSpan && latSpan >= minLatSpan) continue;
+
+                // Scale uniformly so the smaller axis meets its minimum
+                double factor = Math.Max(
+                    lonSpan > 0 ? minLonSpan / lonSpan : minLonSpan,
+                    latSpan > 0 ? minLatSpan / latSpan : minLatSpan);
+
+                double cx = (mnLon + mxLon) / 2.0;
+                double cy = (mnLat + mxLat) / 2.0;
+
+                foreach (var poly in polys)
+                    foreach (var ring in poly)
+                        for (int k = 0; k < ring.Count; k++)
+                            ring[k] = (cx + (ring[k].lon - cx) * factor,
+                                       cy + (ring[k].lat - cy) * factor);
+            }
+
+            // ── 3. Quantize and build arc list ────────────────────────────────
+            var arcs         = new List<List<(int x, int y)>>();
+            var featureGeoms = new List<(string gtype, List<List<int>> polyArcLists)>();
+
+            for (int fi = 0; fi < featureRings.Count; fi++)
+            {
+                var (gtype, polys) = featureRings[fi];
+                var polyArcLists = new List<List<int>>();
+
+                foreach (var poly in polys)
+                {
+                    var arcIndicesForPoly = new List<int>();
+                    foreach (var ring in poly)
+                    {
+                        var qpts = ring.Select(pt => Quantize(pt.lon, pt.lat)).ToList();
+
+                        // Remove consecutive duplicates introduced by quantization
                         var deduped = new List<(int x, int y)> { qpts[0] };
                         for (int i = 1; i < qpts.Count; i++)
                             if (qpts[i] != deduped[^1]) deduped.Add(qpts[i]);
 
-                        // Need at least 3 distinct points to form a valid ring
                         if (deduped.Count < 3) continue;
 
                         // Ensure ring is closed
                         if (deduped[0] != deduped[^1]) deduped.Add(deduped[0]);
 
-                        // Each ring becomes its own arc — no deduplication
                         arcIndicesForPoly.Add(arcs.Count);
                         arcs.Add(deduped);
                     }
-
                     if (arcIndicesForPoly.Count > 0)
                         polyArcLists.Add(arcIndicesForPoly);
                 }
-
-                featureGeoms.Add((gtype == "MultiPolygon" ? "MultiPolygon" : "Polygon", polyArcLists));
+                featureGeoms.Add((gtype, polyArcLists));
             }
 
-            // ── 2. Encode arcs as delta sequences and serialise ───────────────
+            // ── 4. Encode arcs as delta sequences and serialise ───────────────
             var sb = new StringBuilder();
             sb.Append("{\"type\":\"Topology\",");
             sb.Append("\"transform\":{");
@@ -327,7 +385,7 @@ namespace TopoExporter.Services
 
             sb.Append("],\"objects\":{\"countries\":{\"type\":\"GeometryCollection\",\"geometries\":[");
 
-            // ── 3. Write feature geometries ───────────────────────────────────
+            // ── 5. Write feature geometries ───────────────────────────────────
             for (int fi = 0; fi < features.Count; fi++)
             {
                 if (fi > 0) sb.Append(',');
@@ -364,7 +422,6 @@ namespace TopoExporter.Services
                 }
                 else
                 {
-                    // Polygon: outer ring + optional hole rings, all in one array
                     sb.Append("Polygon\",\"arcs\":[[");
                     var arcIndices = polyArcLists[0];
                     for (int ai = 0; ai < arcIndices.Count; ai++)
@@ -384,6 +441,7 @@ namespace TopoExporter.Services
             sb.Append("]}}}");
             return sb.ToString();
         }
+
 
     }
 
