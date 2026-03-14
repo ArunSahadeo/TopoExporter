@@ -236,8 +236,8 @@ namespace TopoExporter
             var dlg = new Microsoft.Win32.SaveFileDialog
             {
                 FileName   = "export",
-                DefaultExt = ".topojson",
-                Filter     = "TopoJSON (*.topojson)|*.topojson|JSON (*.json)|*.json"
+                DefaultExt = ".json",
+                Filter     = "JSON (*.json)|*.json|TopoJSON (*.topojson)|*.topojson"
             };
             if (dlg.ShowDialog() != true) return;
 
