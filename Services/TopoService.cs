@@ -40,7 +40,8 @@ namespace TopoExporter.Services
             {"Akrotiri", "Akrotiri and Dhekelia"},
             {"Republic of Cabo Verde", "Cabo Verde"},
             {"Federated States of Micronesia", "Micronesia"},
-            {"Falkland Islands / Malvinas", "Falkland Islands"}
+            {"Falkland Islands / Malvinas", "Falkland Islands"},
+            {"Macao", "Macau"}
         };
 
         public TopoService() => Directory.CreateDirectory(AppDataDir);
