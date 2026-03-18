@@ -161,15 +161,35 @@ namespace TopoExporter.Services
 
         // ── Preset ────────────────────────────────────────────────────────────
 
-        public void SavePreset(IEnumerable<string> codes) =>
-            File.WriteAllText(PresetPath,
+        public void SavePreset(IEnumerable<string> codes) {
+            var dlg = new Microsoft.Win32.SaveFileDialog
+            {
+                FileName   = "preset",
+                DefaultExt = ".json",
+                InitialDirectory = AppDataDir,
+                Filter     = "JSON (*.json)|*.json"
+            };
+
+            if (dlg.ShowDialog() != true) return;
+
+            File.WriteAllText(dlg.FileName,
                 JsonConvert.SerializeObject(codes.ToList(), Formatting.Indented));
+        }
 
         public List<string> LoadPreset()
         {
-            if (!File.Exists(PresetPath)) return new();
+            var dlg = new Microsoft.Win32.OpenFileDialog
+            {
+                FileName   = "preset",
+                DefaultExt = ".json",
+                InitialDirectory = AppDataDir,
+                Filter     = "JSON (*.json)|*.json"
+            };
+
+            if (dlg.ShowDialog() != true) return new();
+
             return JsonConvert.DeserializeObject<List<string>>(
-                File.ReadAllText(PresetPath)) ?? new();
+                File.ReadAllText(dlg.FileName)) ?? new();
         }
 
         // ── Property helpers ──────────────────────────────────────────────────
