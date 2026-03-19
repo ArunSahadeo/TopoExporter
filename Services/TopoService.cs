@@ -190,7 +190,7 @@ namespace TopoExporter.Services
                 .ToList();
 
             progress?.Report($"Converting {featuresByCode.Count} countries to TopoJSON…");
-            var topoJson = await Task.Run(() => BuildTopoJson(featuresByCode));
+            var topoJson = await Task.Run(() => BuildTopoJson(featuresByCode, progress));
 
             progress?.Report("Writing file…");
             await File.WriteAllTextAsync(outputPath, topoJson, Encoding.UTF8);
@@ -291,7 +291,7 @@ namespace TopoExporter.Services
         // Arc deduplication is an optional TopoJSON optimisation; Power BI and
         // every other TopoJSON consumer work correctly without it.
         //
-        private static string BuildTopoJson(List<IGrouping<string, JToken>> featureGroups)
+        private static string BuildTopoJson(List<IGrouping<string, JToken>> featureGroups, IProgress<string>? progress = null)
         {
             const int Q = 50_000; // quantisation grid size — high enough for small territories like HK and Singapore to render smoothly when zoomed
 
@@ -349,47 +349,7 @@ namespace TopoExporter.Services
                 featureRings.Add((polys.Count > 1 ? "MultiPolygon" : "Polygon", polys, group.First()));
             }
 
-            // ── 2. Inflate small features in lon/lat space ────────────────────
-            // A shape map canvas is roughly 800×500 px for a full-world view.
-            // Anything spanning less than ~6 px in either axis is invisible.
-            // We inflate the raw coordinates (before quantization) so the shape
-            // stays geometrically faithful — no jagged integer-scaling artefacts.
-            //
-            // Min visible span: 6 px → 6×(360/800) = 2.7° lon, 6×(180/500) = 2.16° lat
-            const double minLonSpan = 6.0 * 360.0 / 800.0;  // ~2.7°
-            const double minLatSpan = 6.0 * 180.0 / 500.0;  // ~2.16°
-
-            foreach (var (_, polys, _) in featureRings)
-            {
-                if (polys.Count == 0) continue;
-
-                var allPts = polys.SelectMany(p => p).SelectMany(r => r).ToList();
-                double mnLon = allPts.Min(p => p.lon);
-                double mxLon = allPts.Max(p => p.lon);
-                double mnLat = allPts.Min(p => p.lat);
-                double mxLat = allPts.Max(p => p.lat);
-
-                double lonSpan = mxLon - mnLon;
-                double latSpan = mxLat - mnLat;
-
-                if (lonSpan >= minLonSpan && latSpan >= minLatSpan) continue;
-
-                // Scale uniformly so the smaller axis meets its minimum
-                double factor = Math.Max(
-                    lonSpan > 0 ? minLonSpan / lonSpan : minLonSpan,
-                    latSpan > 0 ? minLatSpan / latSpan : minLatSpan);
-
-                double cx = (mnLon + mxLon) / 2.0;
-                double cy = (mnLat + mxLat) / 2.0;
-
-                foreach (var poly in polys)
-                    foreach (var ring in poly)
-                        for (int k = 0; k < ring.Count; k++)
-                            ring[k] = (cx + (ring[k].lon - cx) * factor,
-                                       cy + (ring[k].lat - cy) * factor);
-            }
-
-            // ── 3. Quantize and build arc list ────────────────────────────────
+            // ── 2. Quantize and build arc list ────────────────────────────────
             var arcs         = new List<List<(int x, int y)>>();
             var featureGeoms = new List<(string gtype, List<List<int>> polyArcLists)>();
 
@@ -422,9 +382,27 @@ namespace TopoExporter.Services
                         polyArcLists.Add(arcIndicesForPoly);
                 }
                 featureGeoms.Add((gtype, polyArcLists));
+
+                // ── Diagnostic: warn if any polygons were silently dropped ────
+                var props0    = featureRings[fi].repFeature["properties"] as JObject ?? new JObject();
+                var diagName  = BestName(props0);
+                var inPolys   = featureRings[fi].polys.Count;
+                var outPolys  = polyArcLists.Count;
+                if (outPolys == 0)
+                {
+                    var msg = $"⚠ {diagName}: all {inPolys} polygon(s) dropped after quantization — country will not highlight.";
+                    progress?.Report(msg);
+                    Log(msg);
+                }
+                else if (outPolys < inPolys)
+                {
+                    var msg = $"⚠ {diagName}: {inPolys - outPolys} of {inPolys} polygon(s) dropped after quantization ({outPolys} kept).";
+                    progress?.Report(msg);
+                    Log(msg);
+                }
             }
 
-            // ── 4. Encode arcs as delta sequences and serialise ───────────────
+            // ── 3. Encode arcs as delta sequences and serialise ───────────────
             var sb = new StringBuilder();
             sb.Append("{\"type\":\"Topology\",");
             sb.Append("\"transform\":{");
@@ -452,17 +430,23 @@ namespace TopoExporter.Services
 
             sb.Append("],\"objects\":{\"countries\":{\"type\":\"GeometryCollection\",\"geometries\":[");
 
-            // ── 5. Write feature geometries ───────────────────────────────────
+            // ── 4. Write feature geometries ───────────────────────────────────
             for (int fi = 0; fi < featureRings.Count; fi++)
             {
                 if (fi > 0) sb.Append(',');
                 var (gtype, polyArcLists) = featureGeoms[fi];
                 var props = featureRings[fi].repFeature["properties"] as JObject ?? new JObject();
-                var iso   = BestIsoCode(props);
+                var iso   = BestCode(props);
                 var name  = BestName(props).Replace("\\", "\\\\").Replace("\"", "\\\"");
 
                 if (CountryNamesToStandardise.TryGetValue(name, out var standardName))
                     name = standardName;
+
+                // Report the exact name written to the file so it can be compared
+                // directly against the location field values in Power BI.
+                var nameMsg = $"  → \"{name}\"  (iso: {iso})";
+                progress?.Report(nameMsg);
+                Log(nameMsg);
 
                 sb.Append("{\"type\":\"");
 
@@ -476,27 +460,31 @@ namespace TopoExporter.Services
                     for (int pi = 0; pi < polyArcLists.Count; pi++)
                     {
                         if (pi > 0) sb.Append(',');
-                        sb.Append("[[");
+                        sb.Append('[');
                         var arcIndices = polyArcLists[pi];
                         for (int ai = 0; ai < arcIndices.Count; ai++)
                         {
                             if (ai > 0) sb.Append(',');
+                            sb.Append('[');
                             sb.Append(arcIndices[ai]);
+                            sb.Append(']');
                         }
-                        sb.Append("]]");
+                        sb.Append(']');
                     }
                     sb.Append(']');
                 }
                 else
                 {
-                    sb.Append("Polygon\",\"arcs\":[[");
+                    sb.Append("Polygon\",\"arcs\":[");
                     var arcIndices = polyArcLists[0];
                     for (int ai = 0; ai < arcIndices.Count; ai++)
                     {
                         if (ai > 0) sb.Append(',');
+                        sb.Append('[');
                         sb.Append(arcIndices[ai]);
+                        sb.Append(']');
                     }
-                    sb.Append("]]");
+                    sb.Append(']');
                 }
 
                 sb.Append(",\"properties\":{");
