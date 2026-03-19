@@ -90,7 +90,8 @@
                                         <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}"
                                                   Style="{StaticResource ModernCheckBox}">
                                             <TextBlock Text="{Binding Name}" FontSize="13"
-                                                       TextTrimming="CharacterEllipsis"/>
+                                                       TextTrimming="CharacterEllipsis" MouseEnter="CountryName_MouseEnter" MouseLeave="CountryName_MouseLeave">
+                                            </TextBlock>
                                         </CheckBox>
                                         <Border.Triggers>
                                             <EventTrigger RoutedEvent="Border.MouseEnter"/>
@@ -195,5 +196,15 @@
                 </StackPanel>
             </Border>
         </Grid>
+
+        <Popup x:Name="CountryPopup" Placement="Mouse" AllowsTransparency="True" StaysOpen="False" PopupAnimation="Fade" IsOpen="False">
+            <Border Background="#FCFCFE" BorderBrush="#A0C0E0" BorderThickness="1" CornerRadius="4" Padding="10" MaxWidth="260">
+                <StackPanel DataContext="{Binding SelectedCountryForPopup}" Width="220">
+                    <TextBlock FontWeight="SemiBold" FontSize="14" Text="{Binding Name}"/>
+                    <TextBlock Margin="0,4,0,0" FontSize="12" Foreground="#555" Text="{Binding Code, StringFormat='ISO code: {0}'}"/>
+                    <Button Margin="0,12,0,4" Padding="14,6" HorizontalAlignment="Left" Content="Zoom to country on map" Click="ZoomToCountryClick" CommandParameter="{Binding Code}"/>
+                </StackPanel>
+            </Border>
+        </Popup>
     </Grid>
 </Window>

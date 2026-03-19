@@ -5,6 +5,8 @@ using System.IO;
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Data;
+using System.Windows.Input;
+using System.Windows.Threading;
 using TopoExporter.Models;
 using TopoExporter.Services;
 using TopoExporter.ViewModels;
@@ -36,6 +38,7 @@ namespace TopoExporter
             _vm.SelectionChanged  += OnSelectionChanged;
             _vm.DarkModeChanged   += OnDarkModeChanged;
             _vm.ExportRequested   += OnExportRequested;
+            _vm.ZoomToCountryRequested += OnZoomToCountryRequested;
 
             Loaded += MainWindow_Loaded;
         }
@@ -270,6 +273,16 @@ namespace TopoExporter
             finally { _vm.IsLoading = false; }
         }
 
+        // ── Zoom to country ────────────────────────────────────────────────────────────
+        private async void OnZoomToCountryRequested(string code)
+        {
+            if (MapWebView.CoreWebView2 == null) return;
+
+            // Call your JS function – adjust name/args as needed
+            string js = $"zoomToCountry('{code}');";
+            MapWebView.CoreWebView2.ExecuteScriptAsync(js);
+        }
+
         // ── JS → WPF messages ─────────────────────────────────────────────────
         private void WebView_MessageReceived(
             object? sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -296,6 +309,34 @@ namespace TopoExporter
         {
             SearchBox.Clear();
             _vm.SearchText = string.Empty;
+        }
+
+        private void CountryName_MouseEnter(object sender, MouseEventArgs e)
+        {
+            if (sender is FrameworkElement element && element.DataContext is CountryItem country)
+            {
+                _vm.SelectedCountryForPopup = country;
+                CountryPopup.IsOpen = true;
+            }
+        }
+
+        private void CountryName_MouseLeave(object sender, MouseEventArgs e)
+        {
+            // Optional: small delay so user can move to popup without it closing instantly
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                // Only close if mouse is not over the popup
+                if (!CountryPopup.IsMouseOver)
+                CountryPopup.IsOpen = false;
+            }), DispatcherPriority.Background);
+        }
+
+        private void ZoomToCountryClick(object sender, RoutedEventArgs e)
+        {
+            if (sender is System.Windows.Controls.Button btn && btn.CommandParameter is string code && !string.IsNullOrWhiteSpace(code)) {
+                _vm.RequestZoomToCountry(code);
+                _vm.StatusText = $"Zoom requested for {code}";
+            }
         }
     }
 }

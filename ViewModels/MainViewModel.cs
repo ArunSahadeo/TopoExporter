@@ -42,6 +42,14 @@ namespace TopoExporter.ViewModels
         private string _statusText  = "Loading…";
         private bool   _isLoading   = false;
 
+        private CountryItem _selectedCountryForPopup = null;
+
+        public CountryItem SelectedCountryForPopup
+        {
+            get => _selectedCountryForPopup;
+            set { _selectedCountryForPopup = value; OnPropertyChanged(); }
+        }
+
         // ── Country remapping fields ────────────────────────────────────────────────────
 
         private static readonly string[] CountryNamesToExclude = {
@@ -124,6 +132,7 @@ namespace TopoExporter.ViewModels
         public event Action<IEnumerable<CountryItem>>? SelectionChanged;
         public event Action<bool>? DarkModeChanged;
         public event Func<IEnumerable<CountryItem>, Task>? ExportRequested;
+        public event Action<string>? ZoomToCountryRequested;
 
         // ── Constructor ───────────────────────────────────────────────────────
         public MainViewModel()
@@ -283,6 +292,12 @@ namespace TopoExporter.ViewModels
         {
             IsDarkMode = !IsDarkMode;
             DarkModeChanged?.Invoke(IsDarkMode);
+        }
+
+        // ── Request zoom to country ─────────────────────────────────────────────────────────
+        public void RequestZoomToCountry(string code)
+        {
+            ZoomToCountryRequested?.Invoke(code);
         }
 
         // ── INotifyPropertyChanged ────────────────────────────────────────────
