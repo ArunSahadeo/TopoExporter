@@ -3,6 +3,7 @@ using Newtonsoft.Json.Linq;
 using System.IO;
 using System.Net.Http;
 using System.Text;
+using System.Diagnostics;
 
 namespace TopoExporter.Services
 {
@@ -15,8 +16,11 @@ namespace TopoExporter.Services
         public static readonly string GeoJsonPath =
             Path.Combine(AppDataDir, "ne_10m_admin_0_countries.geojson");
 
+        public static readonly string PresetsDirPath =
+            Path.Combine(AppDataDir, "presets");
+
         public static readonly string PresetPath =
-            Path.Combine(AppDataDir, "preset.json");
+            Path.Combine(PresetsDirPath, "default.json");
 
         private const string GeoJsonUrl =
             "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries.geojson";
@@ -44,7 +48,22 @@ namespace TopoExporter.Services
             {"Macao", "Macau"}
         };
 
-        public TopoService() => Directory.CreateDirectory(AppDataDir);
+        public TopoService()
+        {
+            if (Directory.Exists(AppDataDir)) {
+                return;
+            }
+
+            Directory.CreateDirectory(AppDataDir);
+            Directory.CreateDirectory(PresetsDirPath);
+
+            string[] defaultPresetFiles = Directory.GetFiles(Path.Combine(Directory.GetCurrentDirectory(), "Presets"), "*.json", SearchOption.TopDirectoryOnly);
+
+            foreach (string defaultPresetFile in defaultPresetFiles) {
+                string fName = Path.GetFileName(defaultPresetFile);
+                File.Copy(defaultPresetFile, Path.Combine(PresetsDirPath, fName));
+            }
+        }
 
         // ── Download ──────────────────────────────────────────────────────────
 
@@ -164,9 +183,9 @@ namespace TopoExporter.Services
         public void SavePreset(IEnumerable<string> codes) {
             var dlg = new Microsoft.Win32.SaveFileDialog
             {
-                FileName   = "preset",
+                FileName   = "default",
                 DefaultExt = ".json",
-                InitialDirectory = AppDataDir,
+                InitialDirectory = PresetsDirPath,
                 Filter     = "JSON (*.json)|*.json"
             };
 
@@ -178,18 +197,21 @@ namespace TopoExporter.Services
 
         public List<string> LoadPreset()
         {
+            if (Directory.GetFiles(PresetsDirPath).Length < 1) {
+                return new();
+            }
+
             var dlg = new Microsoft.Win32.OpenFileDialog
             {
-                FileName   = "preset",
+                FileName   = "default",
                 DefaultExt = ".json",
-                InitialDirectory = AppDataDir,
+                InitialDirectory = PresetsDirPath,
                 Filter     = "JSON (*.json)|*.json"
             };
 
             if (dlg.ShowDialog() != true) return new();
 
-            return JsonConvert.DeserializeObject<List<string>>(
-                File.ReadAllText(dlg.FileName)) ?? new();
+            return JsonConvert.DeserializeObject<List<string>>(File.ReadAllText(dlg.FileName));
         }
 
         // ── Property helpers ──────────────────────────────────────────────────
