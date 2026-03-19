@@ -209,7 +209,7 @@ function draw() {
   updateClip();
 }
 
-// Recompute only the 'd' attributes during rotation (faster than full draw)
+// Recompute only the 'd' attributes during rotation/zoom (faster)
 function drawPaths() {
   lOcean.selectAll('path').attr('d', path);
   lGrat.selectAll('path').attr('d', path);
@@ -247,7 +247,7 @@ function featureClass(d) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Drag to rotate
+// Drag to rotate (integrated with zoom behavior)
 // ─────────────────────────────────────────────────────────────────────────────
 let dragOrigin  = null;
 let rotateSnap  = null;
@@ -267,8 +267,6 @@ svg.style('cursor', 'grab')
       const dx = ev.x - dragOrigin[0];
       const dy = ev.y - dragOrigin[1];
       if (Math.abs(dx) + Math.abs(dy) > 3) { hasDragged = true; isDragging = true; }
-      // Sensitivity scales inversely with zoom: at 2x zoom, 1 px rotates half as far.
-      // baseScale / currentScale = 1.0 at default zoom, 0.33 at 3x zoom, etc.
       const sensitivity = 0.22 * (baseScale / currentScale);
       rotate = [
         rotateSnap[0] + dx * sensitivity,
@@ -276,7 +274,7 @@ svg.style('cursor', 'grab')
         0
       ];
       projection.rotate(rotate);
-      drawPaths();   // cheap path-only update during drag
+      drawPaths();
     })
     .on('end', () => {
       dragOrigin = null;
@@ -286,38 +284,64 @@ svg.style('cursor', 'grab')
   );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Zoom
+// Zoom (now using d3.zoom for smooth transitions)
 // ─────────────────────────────────────────────────────────────────────────────
-const ZOOM_MIN = 0.45;
-const ZOOM_MAX = 14;
+const zoomBehavior = d3.zoom()
+  .scaleExtent([0.45, 14])
+  .translateExtent([[-Infinity, -Infinity], [Infinity, Infinity]])
+  .on("zoom", zoomed);
 
-function applyZoom(factor) {
-  currentScale = Math.max(baseScale * ZOOM_MIN,
-                  Math.min(baseScale * ZOOM_MAX, currentScale * factor));
+svg.call(zoomBehavior);
+
+let k = 1;  // current scale multiplier
+
+function zoomed(event) {
+  if (!event) return;
+  const transform = event.transform;
+  k = transform.k;
+  currentScale = baseScale * k;
   projection.scale(currentScale);
-  draw();
+
+  // Small rotation adjustment during pan (orbit feel)
+  const sensitivity = 0.004 / k;
+  const rot = projection.rotate();
+  projection.rotate([
+    rot[0] - transform.x * sensitivity,
+    rot[1] - transform.y * sensitivity,
+    0
+  ]);
+
+  drawPaths();
 }
 
-svg.on('wheel', ev => {
-  ev.preventDefault();
-  applyZoom(ev.deltaY > 0 ? 0.88 : 1.14);
-}, { passive: false });
-
+// Keyboard zoom using zoom behavior
 window.addEventListener('keydown', ev => {
   if (!ev.ctrlKey) return;
   if (ev.key === '+' || ev.key === '=' || ev.code === 'Equal') {
-    ev.preventDefault(); applyZoom(1.2);
+    ev.preventDefault();
+    svg.transition().duration(400).call(zoomBehavior.scaleBy, 1.2);
   } else if (ev.key === '-' || ev.code === 'Minus') {
-    ev.preventDefault(); applyZoom(1 / 1.2);
+    ev.preventDefault();
+    svg.transition().duration(400).call(zoomBehavior.scaleBy, 1 / 1.2);
   } else if (ev.key === '0') {
     ev.preventDefault();
-    currentScale = baseScale; projection.scale(currentScale); draw();
+    resetView();
   }
 });
 
-window.zoomIn    = () => applyZoom(1.2);
-window.zoomOut   = () => applyZoom(1 / 1.2);
-window.zoomReset = () => { currentScale = baseScale; projection.scale(currentScale); draw(); };
+window.zoomIn    = () => svg.transition().duration(400).call(zoomBehavior.scaleBy, 1.2);
+window.zoomOut   = () => svg.transition().duration(400).call(zoomBehavior.scaleBy, 1 / 1.2);
+window.zoomReset = resetView;
+
+function resetView() {
+  svg.transition().duration(750).call(
+    zoomBehavior.transform,
+    d3.zoomIdentity
+  );
+  rotate = [-20, -25, 0];
+  projection.rotate(rotate);
+  draw();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mouse events
@@ -416,14 +440,63 @@ window.updateCountries = function(jsonStr) {
     selectedCodes = new Set(
       list.filter(c => c.isSelected && c.code).map(c => c.code)
     );
-
-    // Update only the CSS class on each path — no geometry recalculation
-    lLand.selectAll('path').attr('class', function(d) {
-      return d ? featureClass(d) : 'country land';
-    });
-
+    lLand.selectAll('path').attr('class', d => d ? featureClass(d) : 'country land');
     updateStatus();
   } catch (e) { console.error('updateCountries:', e); }
+};
+
+window.zoomToCountry = function(isoCode) {
+  if (!isoCode || !geoData) return;
+
+  isoCode = isoCode.toUpperCase().trim();
+
+  const countryPath = lLand.select(`path[data-code="${isoCode}"]`);
+
+  if (countryPath.empty()) {
+    console.warn(`Country not found: ${isoCode}`);
+    return;
+  }
+
+  const datum = countryPath.datum();
+  const centroid = d3.geoCentroid(datum);  // [lon, lat]
+
+  // Step 1: Rotate globe to face the country
+  const targetRotate = [-centroid[0], -centroid[1], 0];
+
+  svg.transition()
+    .duration(800)
+    .tween("rotate", () => {
+      const i = d3.interpolate(projection.rotate(), targetRotate);
+      return t => {
+        projection.rotate(i(t));
+        drawPaths();
+      };
+    })
+    .on("end", () => {
+      // Step 2: Zoom to fit bounds
+      const W = container.clientWidth || window.innerWidth;
+      const H = container.clientHeight || window.innerHeight;
+
+      const [[x0, y0], [x1, y1]] = path.bounds(datum);
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const x = (x0 + x1) / 2;
+      const y = (y0 + y1) / 2;
+
+      const scaleFit = Math.max(1, Math.min(12, 0.85 / Math.max(dx / W, dy / H)));
+      const translate = [W / 2 - x, H / 2 - y];
+
+      svg.transition()
+        .duration(1200)
+        .call(zoomBehavior.transform, d3.zoomIdentity
+          .translate(translate[0], translate[1])
+          .scale(scaleFit)
+        );
+    });
+
+  // Highlight
+  lLand.selectAll("path").classed("selected", false);
+  countryPath.classed("selected", true);
 };
 
 window.exportGeoJSON = function(jsonStr) {
