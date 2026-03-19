@@ -13,6 +13,10 @@ namespace TopoExporter.Services
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "TopoExporter");
 
+        public static readonly string DownloadsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Downloads");
+
         public static readonly string GeoJsonPath =
             Path.Combine(AppDataDir, "ne_10m_admin_0_countries.geojson");
 

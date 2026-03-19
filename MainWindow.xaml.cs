@@ -240,6 +240,7 @@ namespace TopoExporter
             {
                 FileName   = "globe",
                 DefaultExt = ".json",
+                InitialDirectory = TopoService.DownloadsDir,
                 Filter     = "JSON (*.json)|*.json|TopoJSON (*.topojson)|*.topojson"
             };
             if (dlg.ShowDialog() != true) return;
