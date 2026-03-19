@@ -1,4 +1,3 @@
-using System.IO;
 using System.Diagnostics;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -273,12 +272,7 @@ namespace TopoExporter.ViewModels
                 {
                     var st = new StackTrace(true);
                     var frame = st.GetFrame(0);
-
-                    using (StreamWriter sw = File.AppendText(Path.Combine(TopoService.AppDataDir, "debug.log"))) {
-                        sw.WriteLine($"The error from line {frame.GetFileLineNumber()} of {frame.GetFileName()}: {ex.Message}");
-                        sw.WriteLine(ex.ToString());
-                    }
-
+                    TopoService.Log($"Export exception at line {frame?.GetFileLineNumber()} of {frame?.GetFileName()}: {ex.Message}\n{ex}");
                     MessageBox.Show($"Export failed:\n{ex.Message}", "Error",
                         MessageBoxButton.OK, MessageBoxImage.Error);
                     StatusText = "Export failed.";

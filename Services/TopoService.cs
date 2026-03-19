@@ -26,6 +26,20 @@ namespace TopoExporter.Services
         public static readonly string PresetPath =
             Path.Combine(PresetsDirPath, "default.json");
 
+        public static readonly string DebugLogPath =
+            Path.Combine(AppDataDir, "debug.log");
+
+        /// <summary>Appends a timestamped line to debug.log (never throws).</summary>
+        public static void Log(string message)
+        {
+            try
+            {
+                using StreamWriter sw = File.AppendText(DebugLogPath);
+                sw.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+            }
+            catch { /* logging must never crash the app */ }
+        }
+
         private const string GeoJsonUrl =
             "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries.geojson";
 
@@ -156,6 +170,7 @@ namespace TopoExporter.Services
             IProgress<string>? progress = null)
         {
             progress?.Report("Reading source GeoJSON…");
+            Log($"Export started — {selectedCodes.Count()} codes selected.");
             var codeSet  = new HashSet<string>(selectedCodes,
                 StringComparer.OrdinalIgnoreCase);
             var raw      = await File.ReadAllTextAsync(GeoJsonPath);
@@ -179,6 +194,7 @@ namespace TopoExporter.Services
 
             progress?.Report("Writing file…");
             await File.WriteAllTextAsync(outputPath, topoJson, Encoding.UTF8);
+            Log($"Export complete → {outputPath}");
             progress?.Report("Export complete.");
         }
 
